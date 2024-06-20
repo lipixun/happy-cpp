@@ -14,18 +14,21 @@
 #include <exception>
 #include <iostream>
 #include <optional>
+#include <queue>
+#include <semaphore>
 #include <thread>
 
 using namespace std::chrono_literals;
 
-std::vector<std::coroutine_handle<>> waiting_handles;
+using spawn_function = std::function<void(std::coroutine_handle<>)>;
 
 template <typename T>
 class awaitable {
  public:
   //
-  // Promise
+  // Promise type
   //
+
   class promise_type {
    public:
     awaitable get_return_object() {
@@ -33,27 +36,72 @@ class awaitable {
       return awaitable(std::coroutine_handle<promise_type>::from_promise(*this));
     }
 
-    std::suspend_never initial_suspend() noexcept { return {}; }
+    auto initial_suspend() noexcept {
+      struct awaiter {
+        promise_type* this_;
+        bool await_ready() const noexcept { return false; }
+        void await_suspend(std::coroutine_handle<promise_type> h) {
+          // Progragate spawn function from caller to callee
+          //  1. If caller has a spawn function, then the current coroutine handle will be added to queue (and continue
+          //  to run)
+          //  2. If caller doesn't have a spawn function, the current coroutine will be suspended and wait until a spawn
+          //  function is set
+          this_->set_spawn(h.promise().get_spawn());
+        }
+        void await_resume() noexcept {}
+      };
+
+      return awaiter{this};
+    }
 
     std::suspend_always final_suspend() noexcept {
-      if (caller_handle_) {
-        // The callee is completed. And we should schedule the await_resume of caller. (by calling caller_handle())
-        waiting_handles.emplace_back(caller_handle_);
+      if (spawn_ && caller_handle_) {
+        // The callee is completed, and we should schedule the await_resume of caller. (by calling caller_handle())
+        spawn_(caller_handle_);
       }
       return {};
     }
 
-    void unhandled_exception() { exception_ = std::current_exception(); }
+    void unhandled_exception() {
+      // Store exception
+      exception_ = std::current_exception();
+    }
 
     template <std::convertible_to<T> U>
     void return_value(U&& value) {
+      // Store return value
       value_ = std::forward<U>(value);
     }
 
-    void set_caller(std::coroutine_handle<> handle) { caller_handle_ = handle; }
+    void set_caller(std::coroutine_handle<> handle) {
+      // Store the caller of current coroutine.
+      // This function may be called multiple times (one time per co_await from caller)
+      caller_handle_ = handle;
+    }
+
+    //
+    // Get & set spawn function. The handle only by ran when spawn function is set.
+    // The spawn function may be changed at any time current coroutine is suspended.
+    // That means the current coroutine or the caller's coroutine may resume at different thread.
+    //
+    spawn_function get_spawn() { return spawn_; }
+
+    void set_spawn(spawn_function f) {
+      spawn_ = f;
+      if (f && !init_spawned_) {
+        init_spawned_ = true;
+        // Schedule current coroutine to continue from initial_suspend
+        f(std::coroutine_handle<promise_type>::from_promise(*this));
+      }
+    }
 
    private:
     friend awaitable;
+
+    // Check if current coroutine has been resumed after initial suspend.
+    bool init_spawned_ = false;
+    // The spawn function
+    spawn_function spawn_;
     // Store the return value & exception
     std::optional<T> value_;
     std::exception_ptr exception_;
@@ -61,27 +109,35 @@ class awaitable {
     std::coroutine_handle<> caller_handle_;
   };
 
-  ~awaitable() noexcept { handle_.destroy(); }
+  //
+  // Awaitable
+  //
+
+  ~awaitable() noexcept {
+    // Destroy the handle
+    handle_.destroy();
+  }
 
   awaitable(const awaitable&) = delete;  // Cannot copy awaitable
 
-  awaitable(awaitable&& other) noexcept : handle_(std::exchange(other.handle_, {})) {}
+  awaitable(awaitable&& other) noexcept : handle_(std::exchange(other.handle_, {})) {
+    // NOTE: This is tricky. A moved awaitable is not available any more but I didn't handle the case.
+  }
 
-  //
-  // Awaiter
-  //
   constexpr bool await_ready() const noexcept { return false; }
 
-  void await_suspend(std::coroutine_handle<> h) {
-    // The caller coroutine handle
-    handle_.promise().set_caller(h);
+  void await_suspend(std::coroutine_handle<promise_type> h) {
+    // Progragate spawn function from caller to callee and set caller. We can then call spawn_(caller_handle) to resume
+    // the caller later.
+    // NOTE:
+    //  [handle_] is the [callee]'s coroutine_handle
+    //  [h] is the [caller]'s coroutin_handle
+    auto& promise = handle_.promise();
+    promise.set_caller(h);
+    promise.set_spawn(h.promise().get_spawn());
   }
 
   T& await_resume() noexcept { return value(); }
-
-  //
-  // For normal caller
-  //
 
   bool done() noexcept { return handle_.done(); }
 
@@ -92,6 +148,10 @@ class awaitable {
     }
     return *promise.value_;
   }
+
+  spawn_function get_spawn() { return handle_.promise().get_spawn(); }
+
+  void set_spawn(spawn_function f) { return handle_.promise().set_spawn(f); }
 
  private:
   friend promise_type;
@@ -115,7 +175,10 @@ class await_callback {
   }
 
   auto await_resume() noexcept {
-    return [h = this->handle_] { h(); };
+    return [h = this->handle_] {
+      // Add the handle to scheduler to continue the coroutine.
+      h.promise().get_spawn()(h);
+    };
   }
 
  private:
@@ -152,31 +215,67 @@ awaitable<int> complex_func() {
   auto await3 = simple_func(1000);
   auto await4 = simple_func(2000);
   std::cout << "[complex_func] Wait\n";
-  co_return co_await await1 + co_await await2 + co_await await3 + co_await await4;
+  auto value = co_await await1 + co_await await2 + co_await await3 + co_await await4;
+  std::cout << "[complex_func] Done\n";
+  co_return value;
+}
+
+//
+// A simple scheduler
+//
+
+template <typename T>
+T spawn(awaitable<T>&& task) {
+  //
+  // Handle queue and spawn function
+  //
+  std::mutex m;
+  std::counting_semaphore queue_size{0};
+  std::queue<std::coroutine_handle<>> h_queue;
+  spawn_function spawn = [&m, &queue_size, &h_queue](std::coroutine_handle<> h) {
+    {
+      std::lock_guard lock(m);
+      h_queue.emplace(h);
+    }
+    queue_size.release();
+  };
+
+  // Set spawn function (And will actually run the function)
+  task.set_spawn(spawn);
+
+  //
+  // Run handles (Yes, we can implement it in a multi-thread way, it's quite easy to do that)
+  //
+  //  For an industrial implementation, we must consider the following things:
+  //
+  //    1. Cancellation
+  //    2. Effective way to enqueue / dequeue
+  //    3. Dead lock detection
+  //    4. ...
+  //
+  //  Remember: this is just a very simple prototype.
+  //
+  while (!task.done()) {
+    // When all coroutines of current scheduler are suspend. The scheduler should wait for any coroutine becoming ready
+    // to continue (e.g. data received from a socket, user input a string, ...).
+    queue_size.acquire();
+    // Run handles
+    std::coroutine_handle<> handle;
+    {
+      std::lock_guard lock(m);
+      handle = h_queue.front();
+      h_queue.pop();
+    }
+    handle();
+  }
+
+  return task.value();
 }
 
 int main() {
-  std::cout << "[main] Run\n";
-  auto await = complex_func();
-  std::cout << "[main] After complex_func\n";
-
-  while (true) {
-    std::this_thread::sleep_for(10ms);
-    if (await.done()) {
-      // Complete. Result of complex_func should be 3604
-      std::cout << "[main] complex_func done: " << await.value() << std::endl;
-      break;
-    }
-    // A prototype of 'async executor' / 'task scheduler' / ....
-    // All handles stored in the waiting_handles are waiting for being executed.
-    // This simple implementation doesn't need lock since all coroutines are actually run in the main thread.
-    while (waiting_handles.size() > 0) {
-      auto handle = waiting_handles.back();
-      waiting_handles.pop_back();
-      handle();
-    }
-  }
-
+  // Spawn the complex function and wait for it
+  auto result = spawn(complex_func());
+  std::cout << "[main] result:" << result << std::endl;
   return 0;
 }
 

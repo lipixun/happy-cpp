@@ -16,32 +16,36 @@
 #include <iostream>
 #include <optional>
 
-template <typename ReturnType, typename SendType, SendType defaultSendValue>
+template <typename ReturnType, typename SendType, SendType DEFAULT_SEND_VALUE>
 class Generator {
  public:
-  template <typename PromiseType>
-  class SendAwaiter {
+  //
+  // Promise
+  //
+  class promise_type {
    public:
-    constexpr bool await_ready() const noexcept { return false; }
-    void await_suspend(std::coroutine_handle<> h) {}
-    const SendType& await_resume() const noexcept { return handle_.promise().send_value_; }
-    std::coroutine_handle<PromiseType> handle_;
-  };
-
-  class Promise {
-   public:
-    Generator get_return_object() { return Generator(std::coroutine_handle<Promise>::from_promise(*this)); }
+    Generator get_return_object() { return Generator(std::coroutine_handle<promise_type>::from_promise(*this)); }
     std::suspend_always initial_suspend() noexcept { return {}; }
     std::suspend_always final_suspend() noexcept { return {}; }
     void unhandled_exception() { exception_ = std::current_exception(); }
     void return_void() {}
 
     template <std::convertible_to<ReturnType> From>  // C++20 concept
-    SendAwaiter<Promise> yield_value(From&& value) {
+    auto yield_value(From&& value) {
       return_value_ = std::forward<From>(value);
-      return {
-          .handle_ = std::coroutine_handle<Promise>::from_promise(*this),
+
+      struct send_awaiter {
+        std::coroutine_handle<promise_type> handle_;
+
+        constexpr bool await_ready() const noexcept { return false; }
+        void await_suspend(std::coroutine_handle<> h) {}
+        const SendType& await_resume() const noexcept {
+          // Return the send value
+          return handle_.promise().send_value_;
+        }
       };
+
+      return send_awaiter{std::coroutine_handle<promise_type>::from_promise(*this)};
     }
 
     SendType send_value_;
@@ -49,9 +53,13 @@ class Generator {
     std::exception_ptr exception_;
   };
 
-  class Sentinel {};
+  //
+  // Iterator
+  //
 
-  class Iterator {
+  class sentinel {};
+
+  class iterator {
    public:
     using iterator_category = std::input_iterator_tag;
     using difference_type = std::ptrdiff_t;
@@ -60,92 +68,100 @@ class Generator {
     using pointer = ReturnType*;
 
     template <typename T>
-    Iterator(Generator& gen, T&& default_send_value) noexcept
-        : gen_(gen), default_send_value_(std::forward<T>(default_send_value)) {}
-    Iterator(const Iterator&) = default;
-    ~Iterator() = default;
+    iterator(Generator& gen, T&& send_value) noexcept : gen_(gen), send_value_(std::forward<T>(send_value)) {
+      operator++();  // Initial read
+    }
+    iterator(const iterator&) = default;
+    ~iterator() = default;
 
-    friend bool operator==(const Iterator& it, Sentinel) noexcept { return it.gen_.Done(); }
+    friend bool operator==(const iterator& it, sentinel) noexcept {
+      // The iterator stopped when generator is done
+      return it.gen_.Done();
+    }
 
-    Iterator& operator++() {
-      gen_.Next(default_send_value_);
+    iterator& operator++() {
+      gen_.Next(send_value_);
       return *this;
     }
 
     void operator++(int) { operator++(); }
 
-    reference operator*() const { return *gen_.Get(); }
-
-    void Next(SendType&& send_value) { gen_.Next(std::forward<SendType>(send_value)); }
+    reference operator*() const { return gen_.Get(); }
 
    private:
-    friend Generator;
     Generator& gen_;
-    SendType default_send_value_;
+    SendType send_value_;
   };
 
-  using promise_type = Promise;
+  //
+  // Generator
+  //
 
-  Generator(const std::coroutine_handle<Promise>& handle) : handle_(handle) {}
+  Generator(const std::coroutine_handle<promise_type>& handle) : handle_(handle) {}
 
   ~Generator() { handle_.destroy(); }
 
   explicit operator bool() const noexcept { return !handle_.done() && !consumed_; }
 
-  std::optional<ReturnType>& operator()() { return operator()(defaultSendValue); }
-  std::optional<ReturnType>& operator()(SendType&& send_value) {
-    Next(std::forward<SendType>(send_value));
-    return Get();
-  }
-
-  std::optional<ReturnType>& Get() {
+  ReturnType& Get() {
     consumed_ = true;
     if (exception_) {
       std::rethrow_exception(exception_);
     }
-    return value_;
+    return *value_;
   }
 
-  void Next() { Next(defaultSendValue); }
+  bool Next() { return Next(DEFAULT_SEND_VALUE); }
 
   template <typename T>
-  void Next(T&& send_value) {
+  bool Next(T&& send_value) {
     if (!handle_.done()) {
       handle_.promise().send_value_ = std::forward<T>(send_value);
       handle_();
       if (exception_ = handle_.promise().exception_; exception_) {
+        // Has exception, and should return true as if there's new value (To let the exception rethrow by Get)
+        consumed_ = false;
         value_ = {};
+        return true;
       } else if (handle_.done()) {
-        // The final suspend
+        // The final suspend, no more to read
+        consumed_ = true;
         value_ = {};
+        return false;
       } else {
+        // Has new value
         consumed_ = false;
         value_ = std::move(handle_.promise().return_value_);  // Move the value out of promise
+        return true;
       }
     } else {
+      // Done, no more to read
+      consumed_ = true;
       value_ = {};
+      return false;
     }
   }
 
-  bool Done() { return handle_.done(); }
+  bool Done() const { return handle_.done(); }
 
-  Iterator begin() { return begin(defaultSendValue); }
+  iterator begin() { return begin(DEFAULT_SEND_VALUE); }
 
-  Iterator begin(SendType&& send_value) {
-    Next(send_value); // Read the first value
-    return Iterator(*this, std::forward<SendType>(send_value));
+  iterator begin(SendType&& send_value) {
+    // Create iterator by custom send value
+    return iterator(*this, std::forward<SendType>(send_value));
   }
 
-  Sentinel end() noexcept { return {}; }
+  sentinel end() noexcept { return {}; }
 
  private:
-  std::coroutine_handle<Promise> handle_;
+  std::coroutine_handle<promise_type> handle_;
   bool consumed_ = true;
   std::optional<ReturnType> value_;
   std::exception_ptr exception_;
 };
 
-Generator<size_t, size_t, 1> counter(size_t max) {
+template <size_t STEP = 1>
+Generator<size_t, size_t, STEP> counter(size_t max) {
   for (size_t i = 0; i < max;) {
     auto step = co_yield i;
     i += step;
@@ -154,24 +170,12 @@ Generator<size_t, size_t, 1> counter(size_t max) {
 
 int main() {
   //
-  // Usage 0
-  //
-  std::cout << "[+] Usage0" << std::endl;
-  auto gen0 = counter(3);
-  gen0.Next();
-  while (gen0) {
-    std::cout << "main:" << *gen0.Get() << std::endl;
-    gen0.Next();
-  }
-  //
   // Usage 1
   //
   std::cout << "[+] Usage1" << std::endl;
   auto gen1 = counter(5);
-  auto value1 = gen1(2);
-  while (value1) {
-    std::cout << "main:" << *value1 << std::endl;
-    value1 = gen1(2);
+  while (gen1.Next(2)) {
+    std::cout << "main:" << gen1.Get() << std::endl;
   }
   //
   // Usage 2
@@ -194,6 +198,15 @@ int main() {
 
 /*
 Outputs:
+[+] Usage1
+main:0
+main:2
+main:4
+[+] Usage2
+main:0
+main:3
+main:6
+[+] Usage3
 main:0
 main:1
 main:2
