@@ -16,9 +16,9 @@
 template <typename T>
 class Generator {
  public:
-  class Promise {
+  class promise_type {
    public:
-    Generator get_return_object() { return Generator(std::coroutine_handle<Promise>::from_promise(*this)); }
+    Generator get_return_object() { return Generator(std::coroutine_handle<promise_type>::from_promise(*this)); }
     std::suspend_always initial_suspend() noexcept { return {}; }
     std::suspend_always final_suspend() noexcept { return {}; }
     void unhandled_exception() { exception_ = std::current_exception(); }
@@ -34,9 +34,7 @@ class Generator {
     std::exception_ptr exception_;
   };
 
-  using promise_type = Promise;
-
-  Generator(const std::coroutine_handle<Promise>& handle) : handle_(handle) {}
+  Generator(const std::coroutine_handle<promise_type>& handle) : handle_(handle) {}
 
   ~Generator() { handle_.destroy(); }
 
@@ -63,7 +61,7 @@ class Generator {
   }
 
   bool consumed_ = true;
-  std::coroutine_handle<Promise> handle_;
+  std::coroutine_handle<promise_type> handle_;
 };
 
 /*
