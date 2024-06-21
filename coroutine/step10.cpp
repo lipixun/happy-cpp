@@ -4,7 +4,7 @@
  * File Name: step10.cpp
  * Description:
  *
- *  Step10: A simple async queue
+ *  Step10: A simple async scheduler
  *
  */
 
@@ -36,23 +36,7 @@ class awaitable {
       return awaitable(std::coroutine_handle<promise_type>::from_promise(*this));
     }
 
-    auto initial_suspend() noexcept {
-      struct awaiter {
-        promise_type* this_;
-        bool await_ready() const noexcept { return false; }
-        void await_suspend(std::coroutine_handle<promise_type> h) {
-          // Progragate spawn function from caller to callee
-          //  1. If caller has a spawn function, then the current coroutine handle will be added to queue (and continue
-          //  to run)
-          //  2. If caller doesn't have a spawn function, the current coroutine will be suspended and wait until a spawn
-          //  function is set
-          this_->set_spawn(h.promise().get_spawn());
-        }
-        void await_resume() noexcept {}
-      };
-
-      return awaiter{this};
-    }
+    std::suspend_always initial_suspend() noexcept { return {}; }
 
     std::suspend_always final_suspend() noexcept {
       if (spawn_ && caller_handle_) {
@@ -281,29 +265,28 @@ int main() {
 
 /*
 Outputs:
-[main] Run
 [complex_func] Run
-[simple_func] Run
-[mock_heavy_func] Run
-[simple_func] Run
-[mock_heavy_func] Run
-[mock_heavy_func] Wait in thread
-[simple_func] Run
-[mock_heavy_func] Run
-[mock_heavy_func] Wait in thread
-[mock_heavy_func] Wait in thread
-[simple_func] Run
-[mock_heavy_func] Run
 [complex_func] Wait
-[main] After complex_func
+[simple_func] Run
+[mock_heavy_func] Run
 [mock_heavy_func] Wait in thread
 [mock_heavy_func] Awake in thread
 [simple_func] Complete
+[simple_func] Run
+[mock_heavy_func] Run
+[mock_heavy_func] Wait in thread
 [mock_heavy_func] Awake in thread
 [simple_func] Complete
+[simple_func] Run
+[mock_heavy_func] Run
+[mock_heavy_func] Wait in thread
 [mock_heavy_func] Awake in thread
 [simple_func] Complete
+[simple_func] Run
+[mock_heavy_func] Run
+[mock_heavy_func] Wait in thread
 [mock_heavy_func] Awake in thread
 [simple_func] Complete
-[main] complex_func done: 3604
+[complex_func] Done
+[main] result:3604
 */
