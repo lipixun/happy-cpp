@@ -1,6 +1,6 @@
 # Makefile
 
-.PYHONY: all step0.out step1.out step2.out step3.out step4.out step5.out step6.out step7.out step8.out step9.out step10.out clean
+.PYHONY: all clean
 
 all: step0.out step1.out step2.out step3.out step4.out step5.out step6.out step7.out step8.out step9.out step10.out
 
